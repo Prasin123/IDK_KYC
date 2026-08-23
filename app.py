@@ -435,224 +435,137 @@ image_b = render_page(
 # ROI EDITOR
 # ============================================================
 
-st.subheader("3. Create / edit your ROIs")
+st.subheader("3. ROI Editor")
 
 page_rois = get_page_rois(page_number)
 
-
-roi_names = list(page_rois.keys())
-
-
 left, right = st.columns([1, 3])
 
-
 with left:
-
     st.markdown("### ROI Manager")
 
-    if roi_names:
+    roi_names = list(page_rois.keys())
 
+    if roi_names:
         selected_roi = st.selectbox(
             "Select ROI",
             roi_names
         )
-
-        st.session_state.current_roi = selected_roi
-
     else:
-
         selected_roi = None
+        st.info("Create your first ROI.")
 
-        st.info(
-            "No ROIs created for this page."
-        )
-
-    st.markdown("### Add ROI")
+    st.divider()
 
     new_roi_name = st.text_input(
-        "ROI name",
+        "New ROI name",
         placeholder="e.g. full_name"
     )
 
-    if st.button(
-        "➕ Create ROI",
-        use_container_width=True
-    ):
+    if st.button("➕ Add ROI", use_container_width=True):
 
         if not new_roi_name.strip():
-
-            st.error(
-                "Enter an ROI name."
-            )
+            st.error("Enter a name.")
 
         elif new_roi_name in page_rois:
+            st.error("That ROI already exists.")
 
-            st.error(
-                "ROI already exists."
+        else:
+            page_rois[new_roi_name] = {
+                "x": 0.10,
+                "y": 0.10,
+                "width": 0.20,
+                "height": 0.08
+            }
+
+            save_roi_config()
+            st.rerun()
+
+    if selected_roi:
+
+        st.divider()
+
+        if st.button(
+            "🗑️ Delete selected ROI",
+            use_container_width=True
+        ):
+            del page_rois[selected_roi]
+            save_roi_config()
+            st.rerun()
+
+with right:
+
+    st.markdown(
+        "Drag from the **top-left** to **bottom-right** of the field."
+    )
+
+    # Display image at a manageable width
+    display_width = 1000
+
+    coords = streamlit_image_coordinates(
+        image_a,
+        width=display_width,
+        click_and_drag=True,
+        cursor="crosshair",
+        key=f"roi_draw_{page_number}"
+    )
+
+    if coords is not None:
+
+        if selected_roi is None:
+
+            st.warning(
+                "Create/select an ROI name first."
             )
 
         else:
 
-            page_rois[new_roi_name] = create_empty_roi()
+            x1 = coords["x1"]
+            y1 = coords["y1"]
+            x2 = coords["x2"]
+            y2 = coords["y2"]
 
-            save_roi_config()
+            # Handle dragging in either direction
+            left_x = min(x1, x2)
+            top_y = min(y1, y2)
 
-            st.session_state.current_roi = new_roi_name
+            right_x = max(x1, x2)
+            bottom_y = max(y1, y2)
 
-            st.rerun()
+            # Prevent tiny accidental selections
+            if (
+                right_x - left_x >= 5
+                and bottom_y - top_y >= 5
+            ):
 
-
-    st.divider()
-
-    if selected_roi:
-
-        st.markdown(
-            f"**Editing:** `{selected_roi}`"
-        )
-
-        if st.button(
-            "🗑️ Delete ROI",
-            use_container_width=True
-        ):
-
-            del page_rois[selected_roi]
-
-            save_roi_config()
-
-            st.session_state.current_roi = None
-
-            st.rerun()
-
-
-with right:
-
-    if selected_roi:
-
-        current = page_rois[selected_roi]
-
-        canvas_width = 1000
-
-        scale = canvas_width / image_a.width
-
-        canvas_height = int(
-            image_a.height * scale
-        )
-
-        # Convert normalized ROI to canvas coordinates
-        start_x = current["x"] * canvas_width
-        start_y = current["y"] * canvas_height
-
-        roi_width = current["width"] * canvas_width
-        roi_height = current["height"] * canvas_height
-
-        initial_drawing = {
-            "version": "4.4.0",
-            "objects": [
-                {
-                    "type": "rect",
-                    "left": start_x,
-                    "top": start_y,
-                    "width": roi_width,
-                    "height": roi_height,
-                    "fill": "rgba(255, 0, 0, 0.15)",
-                    "stroke": "red",
-                    "strokeWidth": 2
-                }
-            ]
-        }
-
-        st.write(
-            "Drag the rectangle or resize it using the corners."
-        )
-
-        canvas_result = st_canvas(
-            fill_color="rgba(255, 0, 0, 0.15)",
-            stroke_width=2,
-            stroke_color="red",
-            background_image=image_a,
-            update_streamlit=True,
-            height=canvas_height,
-            width=canvas_width,
-            drawing_mode="transform",
-            initial_drawing=initial_drawing,
-            key=f"canvas_{page_number}_{selected_roi}"
-        )
-
-        if canvas_result.json_data:
-
-            objects = canvas_result.json_data.get(
-                "objects",
-                []
-            )
-
-            if objects:
-
-                obj = objects[0]
-
-                left_px = obj.get(
-                    "left",
-                    start_x
-                )
-
-                top_px = obj.get(
-                    "top",
-                    start_y
-                )
-
-                width_px = obj.get(
-                    "width",
-                    roi_width
-                )
-
-                height_px = obj.get(
-                    "height",
-                    roi_height
-                )
-
-                # Account for object scaling
-                object_scale_x = obj.get(
-                    "scaleX",
-                    1
-                )
-
-                object_scale_y = obj.get(
-                    "scaleY",
-                    1
-                )
-
-                width_px *= object_scale_x
-                height_px *= object_scale_y
-
-                # Convert back to normalized coordinates
                 normalized_roi = {
-                    "x": left_px / canvas_width,
-                    "y": top_px / canvas_height,
-                    "width": width_px / canvas_width,
-                    "height": height_px / canvas_height
+                    "x": left_x / display_width,
+                    "y": top_y / int(
+                        image_a.height *
+                        display_width /
+                        image_a.width
+                    ),
+                    "width": (
+                        right_x - left_x
+                    ) / display_width,
+                    "height": (
+                        bottom_y - top_y
+                    ) / int(
+                        image_a.height *
+                        display_width /
+                        image_a.width
+                    )
                 }
 
-                if st.button(
-                    "💾 Save ROI Position",
-                    use_container_width=True
-                ):
+                page_rois[selected_roi] = normalized_roi
 
-                    page_rois[selected_roi] = normalized_roi
+                save_roi_config()
 
-                    save_roi_config()
+                st.success(
+                    f"Saved ROI: {selected_roi}"
+                )
 
-                    st.success(
-                        f"Saved `{selected_roi}`"
-                    )
-
-                    st.rerun()
-
-    else:
-
-        st.image(
-            image_a,
-            caption="PDF A",
-            use_container_width=True
-        )
+                st.rerun()
 
 
 # ============================================================
