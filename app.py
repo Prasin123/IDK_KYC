@@ -567,6 +567,75 @@ with right:
 
                 st.rerun()
 
+if selected_roi:
+
+    st.divider()
+
+    st.subheader(
+        f"Fine adjustment — {selected_roi}"
+    )
+
+    roi = page_rois[selected_roi]
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        x = st.number_input(
+            "X",
+            value=float(roi["x"]),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.001,
+            format="%.4f"
+        )
+
+    with c2:
+        y = st.number_input(
+            "Y",
+            value=float(roi["y"]),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.001,
+            format="%.4f"
+        )
+
+    with c3:
+        width = st.number_input(
+            "Width",
+            value=float(roi["width"]),
+            min_value=0.001,
+            max_value=1.0,
+            step=0.001,
+            format="%.4f"
+        )
+
+    with c4:
+        height = st.number_input(
+            "Height",
+            value=float(roi["height"]),
+            min_value=0.001,
+            max_value=1.0,
+            step=0.001,
+            format="%.4f"
+        )
+
+    if st.button(
+        "💾 Save adjusted ROI",
+        use_container_width=True
+    ):
+
+        page_rois[selected_roi] = {
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height
+        }
+
+        save_roi_config()
+
+        st.success("ROI updated.")
+        st.rerun()
+
 
 # ============================================================
 # ROI OVERVIEW
