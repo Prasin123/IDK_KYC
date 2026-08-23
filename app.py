@@ -2,9 +2,9 @@ import json
 import re
 from pathlib import Path
 
-import cv2
+
 import fitz  # PyMuPDF
-import numpy as np
+
 import pytesseract
 
 from PIL import Image
@@ -128,46 +128,38 @@ def render_page(pdf, page_number, zoom=2.0):
 # IMAGE / OCR
 # ============================================================
 
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+
 def preprocess_image(image):
     """
-    Preprocess image before sending it to Tesseract.
+    OCR preprocessing using PIL only.
+    No OpenCV dependency required.
     """
 
-    img = np.array(image)
-
-    # RGB -> grayscale
-    gray = cv2.cvtColor(
-        img,
-        cv2.COLOR_RGB2GRAY
-    )
+    # Convert to grayscale
+    image = ImageOps.grayscale(image)
 
     # Upscale
-    gray = cv2.resize(
-        gray,
-        None,
-        fx=2,
-        fy=2,
-        interpolation=cv2.INTER_CUBIC
+    width, height = image.size
+
+    image = image.resize(
+        (width * 2, height * 2),
+        Image.Resampling.LANCZOS
     )
 
-    # Remove small noise
-    gray = cv2.GaussianBlur(
-        gray,
-        (3, 3),
-        0
+    # Increase contrast
+    image = ImageEnhance.Contrast(image).enhance(2.0)
+
+    # Sharpen
+    image = image.filter(
+        ImageFilter.SHARPEN
     )
 
-    # Adaptive threshold
-    thresh = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11
-    )
+    # Convert to high contrast black/white
+    image = ImageOps.autocontrast(image)
 
-    return Image.fromarray(thresh)
+    return image
 
 
 def normalize_text(text):
