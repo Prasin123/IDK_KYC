@@ -1,562 +1,947 @@
-"""
-KYC & Citizenship Document Validator — Bank Demo Prototype
-============================================================
-Built for: Siddhartha Bank KYC Form (Page 1) & Nepali Citizenship Certificate
-Stack: Streamlit + PyMuPDF (fitz) + OpenCV + Pillow + pytesseract
-
-Run with:  streamlit run app.py
-"""
-
-import io
 import json
-import os
-from datetime import datetime
+import re
+from pathlib import Path
 
 import cv2
 import fitz  # PyMuPDF
 import numpy as np
 import pytesseract
-import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
 
-# ----------------------------------------------------------------------------
-# CONSTANTS & CONFIG
-# ----------------------------------------------------------------------------
+from PIL import Image
+import streamlit as st
+
+from streamlit_drawable_canvas import st_canvas
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+APP_TITLE = "PDF OCR Information Verifier"
+
+ROI_FILE = Path("roi_config.json")
+
+# If Tesseract is not in PATH, uncomment and change this:
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+# ============================================================
+# PAGE SETUP
+# ============================================================
 
 st.set_page_config(
-    page_title="KYC & Citizenship Document Validator",
-    page_icon="🏦",
-    layout="wide",
+    page_title=APP_TITLE,
+    page_icon="🔍",
+    layout="wide"
 )
 
-ROI_CONFIG_PATH = "saved_rois.json"
-
-TEMPLATES = {
-    "Citizenship Certificate": [
-        "Full Name (नाम थर)",
-        "Citizenship Number (ना. प्र. नं.)",
-        "Date of Birth (जन्म मिति)",
-        "Permanent Address (स्थायी बासस्थान)",
-    ],
-    "Siddhartha Bank KYC Form (Page 1)": [
-        "Applicant Name (निवेदकको नाम)",
-        "Date of Birth (जन्म मिति)",
-        "Citizenship No. (नागरिकता नं.)",
-        "Issue District (जारी भएको जिल्ला)",
-    ],
-}
-
-# Default ROIs expressed as FRACTIONS of image width/height (0.0 - 1.0).
-# Fractional coordinates make the ROI boxes automatically scale to any
-# uploaded document resolution, which removes the #1 source of
-# out-of-bounds crashes when moving between scans of different sizes.
-DEFAULT_ROIS = {
-    "Citizenship Certificate": {
-        "Full Name (नाम थर)": {"x": 0.28, "y": 0.20, "w": 0.60, "h": 0.06},
-        "Citizenship Number (ना. प्र. नं.)": {"x": 0.28, "y": 0.28, "w": 0.60, "h": 0.06},
-        "Date of Birth (जन्म मिति)": {"x": 0.28, "y": 0.36, "w": 0.60, "h": 0.06},
-        "Permanent Address (स्थायी बासस्थान)": {"x": 0.28, "y": 0.44, "w": 0.60, "h": 0.09},
-    },
-    "Siddhartha Bank KYC Form (Page 1)": {
-        "Applicant Name (निवेदकको नाम)": {"x": 0.30, "y": 0.15, "w": 0.62, "h": 0.05},
-        "Date of Birth (जन्म मिति)": {"x": 0.30, "y": 0.22, "w": 0.35, "h": 0.05},
-        "Citizenship No. (नागरिकता नं.)": {"x": 0.30, "y": 0.29, "w": 0.45, "h": 0.05},
-        "Issue District (जारी भएको जिल्ला)": {"x": 0.30, "y": 0.36, "w": 0.45, "h": 0.05},
-    },
-}
-
-BOX_COLORS = [
-    (230, 57, 70),
-    (29, 53, 87),
-    (42, 157, 143),
-    (233, 111, 45),
-    (106, 76, 156),
-    (38, 70, 83),
-]
-
-CHECK_ITEMS = [
-    ("legible", "☑️ Document Legible"),
-    ("details_match", "☑️ Details Match Bank Records"),
-    ("kyc_approved", "☑️ KYC Approved"),
-]
+st.title("🔍 PDF OCR Information Verifier")
+st.caption(
+    "Upload two PDFs, define your own ROIs, OCR them, and compare the information."
+)
 
 
-# ----------------------------------------------------------------------------
-# ROI CONFIG PERSISTENCE
-# ----------------------------------------------------------------------------
+# ============================================================
+# SESSION STATE
+# ============================================================
 
-def load_roi_config() -> dict:
-    """Load saved ROI config from disk, falling back to defaults on any issue.
-    Guarantees every template/field key exists so the UI never KeyErrors,
-    even if the JSON on disk is partial, stale, or corrupted."""
-    config = json.loads(json.dumps(DEFAULT_ROIS))  # deep copy of defaults
+if "rois" not in st.session_state:
+    st.session_state.rois = {}
 
-    if os.path.exists(ROI_CONFIG_PATH):
-        try:
-            with open(ROI_CONFIG_PATH, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            for template, fields in TEMPLATES.items():
-                if template in saved and isinstance(saved[template], dict):
-                    for field in fields:
-                        roi = saved[template].get(field)
-                        if isinstance(roi, dict) and all(k in roi for k in ("x", "y", "w", "h")):
-                            config[template][field] = {
-                                "x": float(roi["x"]),
-                                "y": float(roi["y"]),
-                                "w": float(roi["w"]),
-                                "h": float(roi["h"]),
-                            }
-        except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
-            st.sidebar.warning(f"⚠️ Could not read saved ROI file, using defaults. ({e})")
+if "current_roi" not in st.session_state:
+    st.session_state.current_roi = None
 
-    return config
+if "pdf_a" not in st.session_state:
+    st.session_state.pdf_a = None
+
+if "pdf_b" not in st.session_state:
+    st.session_state.pdf_b = None
 
 
-def save_roi_config(rois: dict) -> bool:
+# ============================================================
+# ROI FILE FUNCTIONS
+# ============================================================
+
+def load_roi_config():
+    if not ROI_FILE.exists():
+        return {}
+
     try:
-        with open(ROI_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(rois, f, ensure_ascii=False, indent=2)
-        return True
-    except OSError as e:
-        st.error(f"❌ Could not save ROI config: {e}")
-        return False
-
-
-# ----------------------------------------------------------------------------
-# SESSION STATE INITIALISATION
-# ----------------------------------------------------------------------------
-
-def init_session_state():
-    if "rois" not in st.session_state:
-        st.session_state.rois = load_roi_config()
-    if "doc_type" not in st.session_state:
-        st.session_state.doc_type = "Citizenship Certificate"
-    if "working_image" not in st.session_state:
-        st.session_state.working_image = None
-    if "page_num" not in st.session_state:
-        st.session_state.page_num = 1
-    if "extracted" not in st.session_state:
-        st.session_state.extracted = {}
-    if "edited" not in st.session_state:
-        st.session_state.edited = {}
-    if "checks" not in st.session_state:
-        st.session_state.checks = {key: False for key, _ in CHECK_ITEMS}
-    if "ocr_lang" not in st.session_state:
-        st.session_state.ocr_lang = "nep+eng"
-    if "last_upload_name" not in st.session_state:
-        st.session_state.last_upload_name = None
-    # Version counters force Streamlit to mint fresh widget keys whenever
-    # we update a value *programmatically* (OCR results, ROI reset).
-    # Streamlit widgets ignore a new `value=` once their key already exists
-    # in session_state, so bumping the version is what makes those
-    # programmatic updates actually show up on screen.
-    if "extract_version" not in st.session_state:
-        st.session_state.extract_version = 0
-    if "roi_version" not in st.session_state:
-        st.session_state.roi_version = 0
-
-
-# ----------------------------------------------------------------------------
-# DOCUMENT LOADING (PDF / IMAGE) — strictly single page at a time
-# ----------------------------------------------------------------------------
-
-def render_pdf_page(file_bytes: bytes, page_index: int, dpi: int = 220) -> Image.Image:
-    """Render a single PDF page (0-indexed) to a PIL RGB Image."""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    try:
-        if page_index < 0 or page_index >= doc.page_count:
-            raise IndexError("Page index out of range.")
-        page = doc.load_page(page_index)
-        zoom = dpi / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-        return img
-    finally:
-        doc.close()
-
-
-def get_pdf_page_count(file_bytes: bytes) -> int:
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    try:
-        return doc.page_count
-    finally:
-        doc.close()
-
-
-# ----------------------------------------------------------------------------
-# ROI GEOMETRY HELPERS
-# ----------------------------------------------------------------------------
-
-def fractional_to_pixels(roi: dict, img_w: int, img_h: int):
-    """Convert a fractional ROI {x,y,w,h} into a safely clamped pixel box."""
-    x = int(round(max(0.0, min(0.99, float(roi.get("x", 0.0)))) * img_w))
-    y = int(round(max(0.0, min(0.99, float(roi.get("y", 0.0)))) * img_h))
-    w = int(round(max(0.01, min(1.0, float(roi.get("w", 0.1)))) * img_w))
-    h = int(round(max(0.01, min(1.0, float(roi.get("h", 0.1)))) * img_h))
-
-    x = max(0, min(x, img_w - 1))
-    y = max(0, min(y, img_h - 1))
-    w = max(1, min(w, img_w - x))
-    h = max(1, min(h, img_h - y))
-    return x, y, w, h
-
-
-def draw_roi_overlay(base_image: Image.Image, fields: list, rois: dict) -> Image.Image:
-    annotated = base_image.copy()
-    draw = ImageDraw.Draw(annotated)
-    try:
-        font = ImageFont.load_default()
+        with open(ROI_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        font = None
-
-    img_w, img_h = annotated.size
-
-    for i, field in enumerate(fields):
-        roi = rois.get(field)
-        if not roi:
-            continue
-        try:
-            x, y, w, h = fractional_to_pixels(roi, img_w, img_h)
-            color = BOX_COLORS[i % len(BOX_COLORS)]
-            draw.rectangle([x, y, x + w, y + h], outline=color, width=3)
-            label = str(i + 1)
-            label_bg = [x, max(0, y - 18), x + 18, y]
-            draw.rectangle(label_bg, fill=color)
-            draw.text((x + 4, max(0, y - 17)), label, fill=(255, 255, 255), font=font)
-        except Exception as e:
-            st.warning(f"⚠️ Could not draw ROI for '{field}': {e}")
-
-    return annotated
+        return {}
 
 
-def crop_roi(image: Image.Image, roi: dict) -> Image.Image:
-    img_w, img_h = image.size
-    x, y, w, h = fractional_to_pixels(roi, img_w, img_h)
-    return image.crop((x, y, x + w, y + h))
-
-
-# ----------------------------------------------------------------------------
-# OCR PIPELINE
-# ----------------------------------------------------------------------------
-
-def preprocess_for_ocr(pil_crop: Image.Image) -> np.ndarray:
-    """OpenCV preprocessing to boost Devanagari OCR accuracy on small crops."""
-    try:
-        rgb = np.array(pil_crop.convert("RGB"))
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-        # Upscale small ROI crops — Tesseract performs noticeably better
-        # on Devanagari script above ~300dpi-equivalent glyph size.
-        gray = cv2.resize(gray, None, fx=2.2, fy=2.2, interpolation=cv2.INTER_CUBIC)
-
-        gray = cv2.bilateralFilter(gray, 7, 50, 50)
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
+def save_roi_config():
+    with open(ROI_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            st.session_state.rois,
+            f,
+            indent=4
         )
-        return thresh
-    except Exception:
-        # Absolute fallback — never let preprocessing crash the pipeline.
-        try:
-            return np.array(pil_crop.convert("L"))
-        except Exception:
-            return np.array(pil_crop)
 
 
-def run_ocr_on_roi(image: Image.Image, roi: dict, lang: str) -> str:
-    """Crop + preprocess + OCR a single field. Never raises — returns ''
-    and lets the caller decide how to surface the problem."""
-    try:
-        crop = crop_roi(image, roi)
-        processed = preprocess_for_ocr(crop)
-        config = "--oem 3 --psm 7"
-        text = pytesseract.image_to_string(processed, lang=lang, config=config)
-        return text.strip()
-    except pytesseract.pytesseract.TesseractNotFoundError:
-        raise
-    except Exception:
-        return ""
+if not st.session_state.rois:
+    st.session_state.rois = load_roi_config()
 
 
-# ----------------------------------------------------------------------------
-# SIDEBAR
-# ----------------------------------------------------------------------------
+# ============================================================
+# PDF FUNCTIONS
+# ============================================================
 
-def render_sidebar():
-    st.sidebar.title("🏦 Validator Controls")
-
-    doc_type = st.sidebar.radio(
-        "Document Type",
-        options=list(TEMPLATES.keys()),
-        index=list(TEMPLATES.keys()).index(st.session_state.doc_type),
-        key="doc_type_radio",
-    )
-    if doc_type != st.session_state.doc_type:
-        st.session_state.doc_type = doc_type
-        # Reset per-document working state on template switch so stale
-        # text/checks from a different template never leak across.
-        st.session_state.extracted = {}
-        st.session_state.edited = {}
-
-    st.sidebar.divider()
-    st.sidebar.subheader("🔤 OCR Settings")
-    st.session_state.ocr_lang = st.sidebar.text_input(
-        "Tesseract language code",
-        value=st.session_state.ocr_lang,
-        help="e.g. 'nep+eng' for Devanagari + Latin, or 'nep' for Devanagari only.",
-    )
-    tess_cmd = st.sidebar.text_input(
-        "Tesseract executable path (optional)",
-        value="",
-        placeholder=r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        help="Only needed on Windows machines where tesseract isn't on PATH.",
-    )
-    if tess_cmd.strip():
-        pytesseract.pytesseract.tesseract_cmd = tess_cmd.strip()
-
-    st.sidebar.divider()
-    st.sidebar.subheader("📐 ROI Configuration")
-
-    col_a, col_b = st.sidebar.columns(2)
-    with col_a:
-        if st.button("💾 Save ROI Config", use_container_width=True):
-            if save_roi_config(st.session_state.rois):
-                st.sidebar.success("Saved to saved_rois.json")
-    with col_b:
-        if st.button("↺ Reset Template", use_container_width=True):
-            st.session_state.rois[st.session_state.doc_type] = json.loads(
-                json.dumps(DEFAULT_ROIS[st.session_state.doc_type])
-            )
-            st.session_state.roi_version += 1  # force sliders to re-init from defaults
-            st.sidebar.info("ROIs reset to defaults for this template.")
-            st.rerun()
-
-    st.sidebar.caption(
-        "ROI positions persist automatically to a local JSON file so the "
-        "next demo session reloads your tuned coordinates."
-    )
-
-
-# ----------------------------------------------------------------------------
-# DOCUMENT UPLOAD + PAGE SELECTION
-# ----------------------------------------------------------------------------
-
-def render_uploader():
-    st.subheader("📤 Upload Document")
-    uploaded_file = st.file_uploader(
-        "Upload a single-page PDF or image (PNG/JPG) of the document",
-        type=["pdf", "png", "jpg", "jpeg"],
-        key="file_uploader",
-    )
-
+def open_pdf(uploaded_file):
+    """
+    Open uploaded PDF using PyMuPDF.
+    """
     if uploaded_file is None:
-        st.session_state.working_image = None
-        st.session_state.last_upload_name = None
-        st.info("👆 Upload a Citizenship Certificate or KYC Form page to begin.")
-        return
+        return None
 
-    try:
-        file_bytes = uploaded_file.getvalue()
-        is_pdf = uploaded_file.name.lower().endswith(".pdf")
-
-        if is_pdf:
-            page_count = get_pdf_page_count(file_bytes)
-            if page_count < 1:
-                st.error("❌ The uploaded PDF appears to have no pages.")
-                st.session_state.working_image = None
-                return
-
-            page_options = list(range(1, page_count + 1))
-            selected_page = st.selectbox(
-                "Select page to process (single page at a time)",
-                options=page_options,
-                index=min(st.session_state.page_num - 1, page_count - 1),
-                key="pdf_page_selector",
-            )
-            st.session_state.page_num = selected_page
-            st.session_state.working_image = render_pdf_page(file_bytes, selected_page - 1)
-        else:
-            img = Image.open(io.BytesIO(file_bytes))
-            img = img.convert("RGB")
-            st.session_state.working_image = img
-            st.session_state.page_num = 1
-
-        st.session_state.last_upload_name = uploaded_file.name
-
-    except fitz.FileDataError:
-        st.error("❌ This PDF could not be read — it may be corrupted or password-protected.")
-        st.session_state.working_image = None
-    except Exception as e:
-        st.error(f"❌ Could not load document: {e}")
-        st.session_state.working_image = None
+    pdf_bytes = uploaded_file.read()
+    return fitz.open(stream=pdf_bytes, filetype="pdf")
 
 
-# ----------------------------------------------------------------------------
-# MAIN TWO-COLUMN WORKSPACE
-# ----------------------------------------------------------------------------
+def render_page(pdf, page_number, zoom=2.0):
+    """
+    Render a PDF page to a PIL image.
+    """
 
-def render_left_column(fields: list):
-    st.markdown("#### 🖼️ Document Preview")
-    image = st.session_state.working_image
-    if image is None:
-        st.warning("⚠️ No document loaded yet.")
-        return
+    page = pdf.load_page(page_number)
 
-    try:
-        rois = st.session_state.rois[st.session_state.doc_type]
-        annotated = draw_roi_overlay(image, fields, rois)
-        st.image(annotated, use_container_width=True, caption=f"Page {st.session_state.page_num}")
-    except Exception as e:
-        st.error(f"❌ Could not render preview overlay: {e}")
-        st.image(image, use_container_width=True)
+    matrix = fitz.Matrix(zoom, zoom)
 
-    legend = "  ".join(
-        f"**{i+1}.** {field}" for i, field in enumerate(fields)
+    pix = page.get_pixmap(
+        matrix=matrix,
+        alpha=False
     )
-    st.caption(legend)
+
+    image = Image.frombytes(
+        "RGB",
+        [pix.width, pix.height],
+        pix.samples
+    )
+
+    return image
 
 
-def render_field_roi_editor(field: str, index: int):
-    doc_type = st.session_state.doc_type
-    roi = st.session_state.rois[doc_type].get(field, {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.05})
+# ============================================================
+# IMAGE / OCR
+# ============================================================
 
-    key_prefix = f"roi_{doc_type}_{index}_{st.session_state.roi_version}"
-    c1, c2 = st.columns(2)
-    with c1:
-        x = st.slider("x (left)", 0.0, 0.99, float(roi["x"]), 0.01, key=f"{key_prefix}_x")
-        w = st.slider("w (width)", 0.01, 1.0, float(roi["w"]), 0.01, key=f"{key_prefix}_w")
-    with c2:
-        y = st.slider("y (top)", 0.0, 0.99, float(roi["y"]), 0.01, key=f"{key_prefix}_y")
-        h = st.slider("h (height)", 0.01, 1.0, float(roi["h"]), 0.01, key=f"{key_prefix}_h")
+def preprocess_image(image):
+    """
+    Preprocess image before sending it to Tesseract.
+    """
 
-    st.session_state.rois[doc_type][field] = {"x": x, "y": y, "w": w, "h": h}
+    img = np.array(image)
 
+    # RGB -> grayscale
+    gray = cv2.cvtColor(
+        img,
+        cv2.COLOR_RGB2GRAY
+    )
 
-def render_right_column(fields: list):
-    st.markdown("#### 📝 Extracted Fields & Verification")
+    # Upscale
+    gray = cv2.resize(
+        gray,
+        None,
+        fx=2,
+        fy=2,
+        interpolation=cv2.INTER_CUBIC
+    )
 
-    image = st.session_state.working_image
+    # Remove small noise
+    gray = cv2.GaussianBlur(
+        gray,
+        (3, 3),
+        0
+    )
 
-    extract_col, _ = st.columns([1, 2])
-    with extract_col:
-        run_clicked = st.button("🔍 Extract Text from ROIs", use_container_width=True, type="primary")
+    # Adaptive threshold
+    thresh = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11
+    )
 
-    if run_clicked:
-        if image is None:
-            st.warning("⚠️ Upload a document before running OCR.")
-        else:
-            try:
-                rois = st.session_state.rois[st.session_state.doc_type]
-                with st.spinner("Running OCR on selected regions..."):
-                    for field in fields:
-                        try:
-                            text = run_ocr_on_roi(image, rois[field], st.session_state.ocr_lang)
-                        except pytesseract.pytesseract.TesseractNotFoundError:
-                            st.error(
-                                "❌ Tesseract OCR engine not found. Install Tesseract "
-                                "(with the Devanagari 'nep' language pack) and/or set "
-                                "the executable path in the sidebar."
-                            )
-                            text = ""
-                        st.session_state.extracted[field] = text
-                        st.session_state.edited[field] = text
-                st.session_state.extract_version += 1  # force text widgets to show new OCR text
-                st.success("✅ OCR extraction complete. Review and correct below.")
-            except Exception as e:
-                st.error(f"❌ OCR pipeline error: {e}")
-
-    for i, field in enumerate(fields):
-        with st.expander(f"**{i + 1}. {field}**", expanded=(i == 0)):
-            render_field_roi_editor(field, i)
-
-            ver = st.session_state.extract_version
-            raw_text = st.session_state.extracted.get(field, "")
-            st.text_input(
-                "OCR Raw Output (read-only)",
-                value=raw_text,
-                disabled=True,
-                key=f"raw_{st.session_state.doc_type}_{i}_{ver}",
-            )
-
-            current_edit = st.session_state.edited.get(field, raw_text)
-            edited_value = st.text_area(
-                "Verified / Corrected Value",
-                value=current_edit,
-                key=f"edit_{st.session_state.doc_type}_{i}_{ver}",
-                height=68,
-            )
-            st.session_state.edited[field] = edited_value
-
-    st.divider()
-    render_verification_checkboxes()
-    st.divider()
-    render_summary_export(fields)
+    return Image.fromarray(thresh)
 
 
-def render_verification_checkboxes():
-    st.markdown("#### ✅ Verification Checklist")
-    cols = st.columns(len(CHECK_ITEMS))
-    for col, (key, label) in zip(cols, CHECK_ITEMS):
-        with col:
-            st.session_state.checks[key] = st.checkbox(
-                label, value=st.session_state.checks.get(key, False), key=f"chk_{key}"
-            )
+def normalize_text(text):
+    """
+    Normalize OCR result so that small formatting differences
+    don't automatically count as mismatches.
+    """
+
+    text = text.lower()
+
+    # Remove leading/trailing whitespace
+    text = text.strip()
+
+    # Replace line breaks with spaces
+    text = text.replace("\n", " ")
+
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
 
 
-def render_summary_export(fields: list):
-    st.markdown("#### 📄 Verification Summary")
+def clean_ocr_text(text):
+    """
+    More aggressive cleaning for comparison.
+    """
 
-    summary = {
-        "document_type": st.session_state.doc_type,
-        "page_number": st.session_state.page_num,
-        "source_file": st.session_state.last_upload_name,
-        "extracted_fields": {field: st.session_state.edited.get(field, "") for field in fields},
-        "verification": {
-            label: st.session_state.checks.get(key, False) for key, label in CHECK_ITEMS
-        },
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    text = normalize_text(text)
+
+    # Remove repeated punctuation
+    text = re.sub(r"[|_~]+", " ", text)
+
+    # Collapse whitespace again
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def ocr_image(image, language="eng"):
+    """
+    Run Tesseract OCR.
+    """
+
+    processed = preprocess_image(image)
+
+    config = "--oem 3 --psm 6"
+
+    text = pytesseract.image_to_string(
+        processed,
+        lang=language,
+        config=config
+    )
+
+    return clean_ocr_text(text)
+
+
+def ocr_with_confidence(image, language="eng"):
+    """
+    OCR with confidence information.
+    """
+
+    processed = preprocess_image(image)
+
+    config = "--oem 3 --psm 6"
+
+    data = pytesseract.image_to_data(
+        processed,
+        lang=language,
+        config=config,
+        output_type=pytesseract.Output.DICT
+    )
+
+    words = []
+    confidences = []
+
+    for i, word in enumerate(data["text"]):
+
+        word = word.strip()
+
+        if not word:
+            continue
+
+        try:
+            confidence = float(data["conf"][i])
+        except Exception:
+            confidence = -1
+
+        words.append(word)
+
+        if confidence >= 0:
+            confidences.append(confidence)
+
+    text = " ".join(words)
+
+    average_confidence = (
+        sum(confidences) / len(confidences)
+        if confidences
+        else 0
+    )
+
+    return clean_ocr_text(text), average_confidence
+
+
+# ============================================================
+# ROI CROPPING
+# ============================================================
+
+def crop_roi(image, roi):
+    """
+    Crop ROI from original-resolution image.
+
+    ROI stores normalized coordinates between 0 and 1.
+    """
+
+    width, height = image.size
+
+    x = int(roi["x"] * width)
+    y = int(roi["y"] * height)
+
+    w = int(roi["width"] * width)
+    h = int(roi["height"] * height)
+
+    x2 = x + w
+    y2 = y + h
+
+    # Bounds checking
+    x = max(0, min(x, width))
+    y = max(0, min(y, height))
+
+    x2 = max(0, min(x2, width))
+    y2 = max(0, min(y2, height))
+
+    return image.crop(
+        (x, y, x2, y2)
+    )
+
+
+# ============================================================
+# ROI MANAGEMENT
+# ============================================================
+
+def get_page_rois(page_number):
+    """
+    Return ROIs for a specific page.
+    """
+
+    page_key = str(page_number)
+
+    if page_key not in st.session_state.rois:
+        st.session_state.rois[page_key] = {}
+
+    return st.session_state.rois[page_key]
+
+
+def create_empty_roi():
+    return {
+        "x": 0.1,
+        "y": 0.1,
+        "width": 0.2,
+        "height": 0.1
     }
 
-    st.json(summary, expanded=False)
 
-    try:
-        json_bytes = json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8")
-        st.download_button(
-            "⬇️ Download JSON Summary",
-            data=json_bytes,
-            file_name=f"kyc_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-    except Exception as e:
-        st.error(f"❌ Could not prepare download: {e}")
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header("⚙️ Settings")
+
+language = st.sidebar.selectbox(
+    "OCR Language",
+    [
+        "eng",
+        "eng+nep"
+    ],
+    index=0
+)
+
+st.sidebar.markdown(
+    "Use `eng` for English or `eng+nep` for English + Nepali."
+)
+
+st.sidebar.divider()
 
 
-# ----------------------------------------------------------------------------
-# APP ENTRY POINT
-# ----------------------------------------------------------------------------
+# ============================================================
+# FILE UPLOAD
+# ============================================================
 
-def main():
-    init_session_state()
-    render_sidebar()
+st.subheader("1. Upload the two PDFs")
 
-    st.title("🏦 KYC & Citizenship Document Validator")
-    st.caption(
-        "Prototype for Siddhartha Bank — Citizenship Certificate & KYC Form (Page 1) verification"
+col1, col2 = st.columns(2)
+
+with col1:
+
+    uploaded_a = st.file_uploader(
+        "PDF A",
+        type=["pdf"],
+        key="pdf_a_upload"
     )
 
-    render_uploader()
+with col2:
+
+    uploaded_b = st.file_uploader(
+        "PDF B",
+        type=["pdf"],
+        key="pdf_b_upload"
+    )
+
+
+if uploaded_a:
+
+    st.session_state.pdf_a = open_pdf(uploaded_a)
+
+if uploaded_b:
+
+    st.session_state.pdf_b = open_pdf(uploaded_b)
+
+
+if not uploaded_a or not uploaded_b:
+
+    st.info(
+        "Upload both PDFs to start."
+    )
+
+    st.stop()
+
+
+pdf_a = st.session_state.pdf_a
+pdf_b = st.session_state.pdf_b
+
+
+# ============================================================
+# PAGE SELECTION
+# ============================================================
+
+st.subheader("2. Choose the page")
+
+max_pages = min(
+    len(pdf_a),
+    len(pdf_b)
+)
+
+page_number = st.number_input(
+    "Page",
+    min_value=1,
+    max_value=max_pages,
+    value=1,
+    step=1
+)
+
+page_index = page_number - 1
+
+
+# ============================================================
+# RENDER PDF A
+# ============================================================
+
+image_a = render_page(
+    pdf_a,
+    page_index,
+    zoom=2.0
+)
+
+image_b = render_page(
+    pdf_b,
+    page_index,
+    zoom=2.0
+)
+
+
+# ============================================================
+# ROI EDITOR
+# ============================================================
+
+st.subheader("3. Create / edit your ROIs")
+
+page_rois = get_page_rois(page_number)
+
+
+roi_names = list(page_rois.keys())
+
+
+left, right = st.columns([1, 3])
+
+
+with left:
+
+    st.markdown("### ROI Manager")
+
+    if roi_names:
+
+        selected_roi = st.selectbox(
+            "Select ROI",
+            roi_names
+        )
+
+        st.session_state.current_roi = selected_roi
+
+    else:
+
+        selected_roi = None
+
+        st.info(
+            "No ROIs created for this page."
+        )
+
+    st.markdown("### Add ROI")
+
+    new_roi_name = st.text_input(
+        "ROI name",
+        placeholder="e.g. full_name"
+    )
+
+    if st.button(
+        "➕ Create ROI",
+        use_container_width=True
+    ):
+
+        if not new_roi_name.strip():
+
+            st.error(
+                "Enter an ROI name."
+            )
+
+        elif new_roi_name in page_rois:
+
+            st.error(
+                "ROI already exists."
+            )
+
+        else:
+
+            page_rois[new_roi_name] = create_empty_roi()
+
+            save_roi_config()
+
+            st.session_state.current_roi = new_roi_name
+
+            st.rerun()
+
+
     st.divider()
 
-    fields = TEMPLATES[st.session_state.doc_type]
+    if selected_roi:
 
-    left, right = st.columns([1, 1])
-    with left:
-        render_left_column(fields)
-    with right:
-        render_right_column(fields)
+        st.markdown(
+            f"**Editing:** `{selected_roi}`"
+        )
+
+        if st.button(
+            "🗑️ Delete ROI",
+            use_container_width=True
+        ):
+
+            del page_rois[selected_roi]
+
+            save_roi_config()
+
+            st.session_state.current_roi = None
+
+            st.rerun()
 
 
-if __name__ == "__main__":
-    main()
+with right:
+
+    if selected_roi:
+
+        current = page_rois[selected_roi]
+
+        canvas_width = 1000
+
+        scale = canvas_width / image_a.width
+
+        canvas_height = int(
+            image_a.height * scale
+        )
+
+        # Convert normalized ROI to canvas coordinates
+        start_x = current["x"] * canvas_width
+        start_y = current["y"] * canvas_height
+
+        roi_width = current["width"] * canvas_width
+        roi_height = current["height"] * canvas_height
+
+        initial_drawing = {
+            "version": "4.4.0",
+            "objects": [
+                {
+                    "type": "rect",
+                    "left": start_x,
+                    "top": start_y,
+                    "width": roi_width,
+                    "height": roi_height,
+                    "fill": "rgba(255, 0, 0, 0.15)",
+                    "stroke": "red",
+                    "strokeWidth": 2
+                }
+            ]
+        }
+
+        st.write(
+            "Drag the rectangle or resize it using the corners."
+        )
+
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 0, 0, 0.15)",
+            stroke_width=2,
+            stroke_color="red",
+            background_image=image_a,
+            update_streamlit=True,
+            height=canvas_height,
+            width=canvas_width,
+            drawing_mode="transform",
+            initial_drawing=initial_drawing,
+            key=f"canvas_{page_number}_{selected_roi}"
+        )
+
+        if canvas_result.json_data:
+
+            objects = canvas_result.json_data.get(
+                "objects",
+                []
+            )
+
+            if objects:
+
+                obj = objects[0]
+
+                left_px = obj.get(
+                    "left",
+                    start_x
+                )
+
+                top_px = obj.get(
+                    "top",
+                    start_y
+                )
+
+                width_px = obj.get(
+                    "width",
+                    roi_width
+                )
+
+                height_px = obj.get(
+                    "height",
+                    roi_height
+                )
+
+                # Account for object scaling
+                object_scale_x = obj.get(
+                    "scaleX",
+                    1
+                )
+
+                object_scale_y = obj.get(
+                    "scaleY",
+                    1
+                )
+
+                width_px *= object_scale_x
+                height_px *= object_scale_y
+
+                # Convert back to normalized coordinates
+                normalized_roi = {
+                    "x": left_px / canvas_width,
+                    "y": top_px / canvas_height,
+                    "width": width_px / canvas_width,
+                    "height": height_px / canvas_height
+                }
+
+                if st.button(
+                    "💾 Save ROI Position",
+                    use_container_width=True
+                ):
+
+                    page_rois[selected_roi] = normalized_roi
+
+                    save_roi_config()
+
+                    st.success(
+                        f"Saved `{selected_roi}`"
+                    )
+
+                    st.rerun()
+
+    else:
+
+        st.image(
+            image_a,
+            caption="PDF A",
+            use_container_width=True
+        )
+
+
+# ============================================================
+# ROI OVERVIEW
+# ============================================================
+
+st.divider()
+
+st.subheader("4. ROI Overview")
+
+if page_rois:
+
+    roi_table = []
+
+    for name, roi in page_rois.items():
+
+        roi_table.append(
+            {
+                "ROI": name,
+                "X": round(roi["x"], 4),
+                "Y": round(roi["y"], 4),
+                "Width": round(roi["width"], 4),
+                "Height": round(roi["height"], 4)
+            }
+        )
+
+    st.dataframe(
+        roi_table,
+        use_container_width=True,
+        hide_index=True
+    )
+
+else:
+
+    st.warning(
+        "Create at least one ROI before running OCR."
+    )
+
+
+# ============================================================
+# OCR COMPARISON
+# ============================================================
+
+st.divider()
+
+st.subheader("5. Compare the PDFs")
+
+
+if st.button(
+    "🔎 OCR + Compare",
+    type="primary",
+    use_container_width=True
+):
+
+    if not page_rois:
+
+        st.error(
+            "You need to create at least one ROI."
+        )
+
+        st.stop()
+
+    results = []
+
+    progress = st.progress(0)
+
+    total = len(page_rois)
+
+    for index, (name, roi) in enumerate(
+        page_rois.items(),
+        start=1
+    ):
+
+        crop_a = crop_roi(
+            image_a,
+            roi
+        )
+
+        crop_b = crop_roi(
+            image_b,
+            roi
+        )
+
+        text_a, confidence_a = ocr_with_confidence(
+            crop_a,
+            language
+        )
+
+        text_b, confidence_b = ocr_with_confidence(
+            crop_b,
+            language
+        )
+
+        normalized_a = normalize_text(
+            text_a
+        )
+
+        normalized_b = normalize_text(
+            text_b
+        )
+
+        match = (
+            normalized_a == normalized_b
+            and normalized_a != ""
+        )
+
+        results.append(
+            {
+                "ROI": name,
+                "PDF A": text_a,
+                "PDF B": text_b,
+                "Confidence A": round(
+                    confidence_a,
+                    1
+                ),
+                "Confidence B": round(
+                    confidence_b,
+                    1
+                ),
+                "Match": match
+            }
+        )
+
+        progress.progress(
+            index / total
+        )
+
+
+    # ========================================================
+    # RESULTS
+    # ========================================================
+
+    st.subheader("Results")
+
+    matches = sum(
+        1
+        for result in results
+        if result["Match"]
+    )
+
+    mismatches = len(results) - matches
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "Total ROIs",
+        len(results)
+    )
+
+    c2.metric(
+        "Matching",
+        matches
+    )
+
+    c3.metric(
+        "Mismatching",
+        mismatches
+    )
+
+    if mismatches == 0:
+
+        st.success(
+            "✅ All OCR regions match."
+        )
+
+    else:
+
+        st.error(
+            f"❌ {mismatches} ROI(s) do not match."
+        )
+
+
+    # ========================================================
+    # INDIVIDUAL RESULTS
+    # ========================================================
+
+    for result in results:
+
+        name = result["ROI"]
+
+        if result["Match"]:
+
+            with st.expander(
+                f"✅ {name}",
+                expanded=False
+            ):
+
+                st.write(
+                    f"**PDF A:** {result['PDF A']}"
+                )
+
+                st.write(
+                    f"**PDF B:** {result['PDF B']}"
+                )
+
+                st.write(
+                    f"Confidence A: {result['Confidence A']}"
+                )
+
+                st.write(
+                    f"Confidence B: {result['Confidence B']}"
+                )
+
+        else:
+
+            with st.expander(
+                f"❌ {name}",
+                expanded=True
+            ):
+
+                a, b = st.columns(2)
+
+                with a:
+
+                    st.markdown("### PDF A")
+
+                    st.error(
+                        result["PDF A"]
+                        if result["PDF A"]
+                        else "[No OCR text]"
+                    )
+
+                    st.caption(
+                        f"Confidence: {result['Confidence A']}"
+                    )
+
+                with b:
+
+                    st.markdown("### PDF B")
+
+                    st.error(
+                        result["PDF B"]
+                        if result["PDF B"]
+                        else "[No OCR text]"
+                    )
+
+                    st.caption(
+                        f"Confidence: {result['Confidence B']}"
+                    )
+
+
+# ============================================================
+# DEBUG PREVIEW
+# ============================================================
+
+st.divider()
+
+st.subheader("6. ROI Preview")
+
+if page_rois:
+
+    for name, roi in page_rois.items():
+
+        crop_a = crop_roi(
+            image_a,
+            roi
+        )
+
+        crop_b = crop_roi(
+            image_b,
+            roi
+        )
+
+        st.markdown(
+            f"### {name}"
+        )
+
+        a, b = st.columns(2)
+
+        with a:
+
+            st.image(
+                crop_a,
+                caption=f"PDF A — {name}",
+                use_container_width=True
+            )
+
+        with b:
+
+            st.image(
+                crop_b,
+                caption=f"PDF B — {name}",
+                use_container_width=True
+            )
