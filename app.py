@@ -10,7 +10,7 @@ import pytesseract
 from PIL import Image
 import streamlit as st
 
-from streamlit_drawable_canvas import st_canvas
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 
 # ============================================================
