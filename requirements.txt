@@ -4,4 +4,4 @@ pytesseract
 pillow
 opencv-python
 numpy
-streamlit-drawable-canvas
+
