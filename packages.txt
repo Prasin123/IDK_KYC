@@ -1,6 +1,2 @@
 tesseract-ocr
 tesseract-ocr-nep
-streamlit
-opencv-python
-pytesseract
-pymupdf
