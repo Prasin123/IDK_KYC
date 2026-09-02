@@ -10,10 +10,6 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 APP_TITLE = "PDF OCR Information Verifier"
 ROI_FILE = Path("roi_config.json")
 
@@ -23,9 +19,6 @@ ROI_FILE = Path("roi_config.json")
 # )
 
 
-# ============================================================
-# PAGE SETUP
-# ============================================================
 
 st.set_page_config(
     page_title=APP_TITLE,
@@ -39,9 +32,7 @@ st.caption(
 )
 
 
-# ============================================================
-# SESSION STATE
-# ============================================================
+
 
 DEFAULT_STATE = {
     "rois": {},
@@ -56,9 +47,6 @@ for key, value in DEFAULT_STATE.items():
         st.session_state[key] = value
 
 
-# ============================================================
-# ROI FILE FUNCTIONS
-# ============================================================
 
 def load_roi_config():
     if not ROI_FILE.exists():
@@ -92,9 +80,6 @@ if not st.session_state.rois:
     st.session_state.rois = load_roi_config()
 
 
-# ============================================================
-# PDF FUNCTIONS
-# ============================================================
 
 def open_pdf(pdf_bytes):
     """Open a PDF from bytes."""
@@ -125,9 +110,7 @@ def render_page(pdf, page_number, zoom=2.0):
     )
 
 
-# ============================================================
-# IMAGE / OCR
-# ============================================================
+
 
 def preprocess_image(image):
     """PIL-only preprocessing; no OpenCV required."""
@@ -217,9 +200,7 @@ def ocr_with_confidence(image, language="eng"):
     return text, average_confidence
 
 
-# ============================================================
-# ROI FUNCTIONS
-# ============================================================
+
 
 def get_page_rois(page_number):
     """Get/create ROI dictionary for a page."""
@@ -319,10 +300,6 @@ def draw_roi_preview(image, rois):
     return preview
 
 
-# ============================================================
-# SIDEBAR
-# ============================================================
-
 st.sidebar.header("⚙️ Settings")
 
 language = st.sidebar.selectbox(
@@ -344,9 +321,6 @@ if st.sidebar.button("🗑️ Clear all saved ROIs", use_container_width=True):
     st.rerun()
 
 
-# ============================================================
-# FILE UPLOAD
-# ============================================================
 
 st.subheader("1. Upload the two PDFs")
 
@@ -388,10 +362,6 @@ if pdf_a is None or pdf_b is None:
     st.stop()
 
 
-# ============================================================
-# PAGE SELECTION
-# ============================================================
-
 st.subheader("2. Choose the page")
 
 max_pages = min(len(pdf_a), len(pdf_b))
@@ -412,9 +382,6 @@ image_b = render_page(pdf_b, page_index, zoom=2.0)
 page_rois = get_page_rois(page_number)
 
 
-# ============================================================
-# ROI EDITOR
-# ============================================================
 
 st.subheader("3. ROI Editor")
 
@@ -543,9 +510,6 @@ with right:
         st.warning("Create and select an ROI before drawing.")
 
 
-# ============================================================
-# FINE ROI ADJUSTMENT
-# ============================================================
 
 if selected_roi:
     st.divider()
@@ -617,10 +581,6 @@ if selected_roi:
         st.rerun()
 
 
-# ============================================================
-# ROI PREVIEW
-# ============================================================
-
 st.divider()
 st.subheader("4. Saved ROI Preview")
 
@@ -655,9 +615,6 @@ else:
     st.warning("Create at least one ROI before running OCR.")
 
 
-# ============================================================
-# OCR COMPARISON
-# ============================================================
 
 st.divider()
 st.subheader("5. Compare the PDFs")
@@ -725,9 +682,6 @@ if st.button(
     st.session_state.last_results = results
 
 
-# ============================================================
-# RESULTS
-# ============================================================
 
 results = st.session_state.last_results
 
@@ -776,9 +730,7 @@ if results:
                 )
 
 
-# ============================================================
-# INDIVIDUAL ROI CROPS
-# ============================================================
+
 
 st.divider()
 st.subheader("6. ROI Image Preview")
